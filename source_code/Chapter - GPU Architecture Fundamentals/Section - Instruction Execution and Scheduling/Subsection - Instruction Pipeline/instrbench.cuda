@@ -1,0 +1,57 @@
+#include <cstdio>
+#include <cstdlib>
+#include <cstdint>
+#include <cuda_runtime.h>
+
+static inline void checkCuda(cudaError_t e, const char* m) {
+    if (e != cudaSuccess) {
+        std::fprintf(stderr, "%s: %s\n", m, cudaGetErrorString(e));
+        std::exit(EXIT_FAILURE);
+    }
+}
+
+__global__ void instr_bench(uint64_t* out_dep, uint64_t* out_ind, int iterations) {
+    int tid = threadIdx.x + blockIdx.x * blockDim.x;
+    if (tid != 0) return;               // only thread 0 measures
+
+    unsigned long long t0 = clock64();
+    float x = 1.0f;
+    #pragma unroll 1                     // prevent unrolling to keep chain dependent
+    for (int i = 0; i < iterations; ++i) x += 1.0f;
+    unsigned long long t1 = clock64();
+
+    t0 = clock64();
+    float y0 = 1.0f, y1 = 2.0f, y2 = 3.0f, y3 = 4.0f;
+    #pragma unroll 1
+    for (int i = 0; i < iterations; ++i) {
+        y0 += 1.0f; y1 += 1.0f; y2 += 1.0f; y3 += 1.0f; // 4-way ILP
+    }
+    unsigned long long t2 = clock64();
+
+    if (out_dep) *out_dep = t1 - t0;
+    if (out_ind) *out_ind = t2 - t1;
+}
+
+int main() {
+    const int iters = 10000000;
+
+    uint64_t *d_dep = nullptr, *d_ind = nullptr;
+    checkCuda(cudaMalloc(&d_dep, sizeof(uint64_t)), "cudaMalloc d_dep");
+    checkCuda(cudaMalloc(&d_ind, sizeof(uint64_t)), "cudaMalloc d_ind");
+
+    instr_bench<<<1, 32>>>(d_dep, d_ind, iters);
+    checkCuda(cudaDeviceSynchronize(), "kernel");
+
+    uint64_t h_dep, h_ind;
+    checkCuda(cudaMemcpy(&h_dep, d_dep, sizeof(uint64_t), cudaMemcpyDeviceToHost), "copy d_dep");
+    checkCuda(cudaMemcpy(&h_ind, d_ind, sizeof(uint64_t), cudaMemcpyDeviceToHost), "copy d_ind");
+
+    std::printf("Dependent chain cycles: %llu for %d ops => %.3f cycles/op\n",
+                static_cast<unsigned long long>(h_dep), iters, static_cast<double>(h_dep) / iters);
+    std::printf("Independent ops cycles: %llu for %d ops (4 ILP) => %.3f cycles/op\n",
+                static_cast<unsigned long long>(h_ind), iters * 4, static_cast<double>(h_ind) / (iters * 4));
+
+    cudaFree(d_dep);
+    cudaFree(d_ind);
+    return 0;
+}
