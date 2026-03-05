@@ -1,0 +1,87 @@
+#include <cstdio>
+#include <cstdlib>
+#include <cstdint>
+#include <string>
+#include <vector>
+#include <cuda_runtime.h>
+
+#define CUDA_CHECK(call)                                                  \
+    do {                                                                  \
+        cudaError_t err = (call);                                         \
+        if (err != cudaSuccess) {                                         \
+            std::fprintf(stderr, "CUDA error %s:%d: %s\n",                \
+                         __FILE__, __LINE__, cudaGetErrorString(err));    \
+            std::exit(EXIT_FAILURE);                                      \
+        }                                                                 \
+    } while (0)
+
+__global__ void vecAdd(const float* __restrict__ a,
+                       const float* __restrict__ b,
+                       float* __restrict__ c,
+                       size_t N) {
+    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < N) c[idx] = a[idx] + b[idx];
+}
+
+int main(int argc, char* argv[]) {
+    if (argc != 6) {
+        std::fprintf(stderr, "Usage: %s <strong|weak> <base_N> <p> <tpb> <reps>\n", argv[0]);
+        return EXIT_FAILURE;
+    }
+
+    const std::string mode = argv[1];
+    const size_t baseN = std::stoull(argv[2]);
+    const int p = std::stoi(argv[3]);
+    const int tpb = std::stoi(argv[4]);
+    const int reps = std::stoi(argv[5]);
+
+    const size_t N = (mode == "strong") ? baseN : baseN * p;
+    const int blocks = (mode == "strong") ? p : static_cast<int>((N + tpb - 1) / tpb);
+
+    float *hA = nullptr, *hB = nullptr, *hC = nullptr;
+    CUDA_CHECK(cudaMallocHost(&hA, N * sizeof(float)));
+    CUDA_CHECK(cudaMallocHost(&hB, N * sizeof(float)));
+    CUDA_CHECK(cudaMallocHost(&hC, N * sizeof(float)));
+
+    for (size_t i = 0; i < N; ++i) {
+        hA[i] = static_cast<float>(i);
+        hB[i] = 1.0f;
+    }
+
+    float *dA = nullptr, *dB = nullptr, *dC = nullptr;
+    CUDA_CHECK(cudaMalloc(&dA, N * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&dB, N * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&dC, N * sizeof(float)));
+
+    CUDA_CHECK(cudaMemcpy(dA, hA, N * sizeof(float), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(dB, hB, N * sizeof(float), cudaMemcpyHostToDevice));
+
+    cudaEvent_t start, stop;
+    CUDA_CHECK(cudaEventCreate(&start));
+    CUDA_CHECK(cudaEventCreate(&stop));
+
+    float totalMs = 0.0f;
+    for (int r = 0; r < reps; ++r) {
+        CUDA_CHECK(cudaEventRecord(start));
+        vecAdd<<<blocks, tpb>>>(dA, dB, dC, N);
+        CUDA_CHECK(cudaEventRecord(stop));
+        CUDA_CHECK(cudaEventSynchronize(stop));
+        float ms;
+        CUDA_CHECK(cudaEventElapsedTime(&ms, start, stop));
+        totalMs += ms;
+    }
+    const float avgMs = totalMs / reps;
+
+    std::printf("mode=%s, N=%zu, blocks=%d, tpb=%d, avg_ms=%.3f\n",
+                mode.c_str(), N, blocks, tpb, avgMs);
+
+    CUDA_CHECK(cudaFree(dA));
+    CUDA_CHECK(cudaFree(dB));
+    CUDA_CHECK(cudaFree(dC));
+    CUDA_CHECK(cudaFreeHost(hA));
+    CUDA_CHECK(cudaFreeHost(hB));
+    CUDA_CHECK(cudaFreeHost(hC));
+    CUDA_CHECK(cudaEventDestroy(start));
+    CUDA_CHECK(cudaEventDestroy(stop));
+    return 0;
+}
