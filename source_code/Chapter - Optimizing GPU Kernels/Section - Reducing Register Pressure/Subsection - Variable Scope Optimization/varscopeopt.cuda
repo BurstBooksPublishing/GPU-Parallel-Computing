@@ -1,0 +1,78 @@
+#include <cstdio>
+#include <cstdlib>
+#include <cuda_runtime.h>
+
+#define CUDA_CHECK(call)                                                  \
+    do {                                                                  \
+        cudaError_t err = (call);                                         \
+        if (err != cudaSuccess) {                                         \
+            fprintf(stderr, "CUDA error %s:%d: %s\n",                     \
+                    __FILE__, __LINE__, cudaGetErrorString(err));         \
+            exit(EXIT_FAILURE);                                           \
+        }                                                                 \
+    } while (0)
+
+__global__ void row_reduce(const float* __restrict__ in,
+                           float* __restrict__ out,
+                           int cols,
+                           int rows) {
+    extern __shared__ float sdata[];
+
+    int tid = threadIdx.x;
+    int row = blockIdx.x * blockDim.x + tid;
+    if (row >= rows) return;
+
+    float sum = 0.0f;
+    const float* rowPtr = in + static_cast<size_t>(row) * cols;
+    for (int c = 0; c < cols; ++c) sum += rowPtr[c];
+    sdata[tid] = sum;
+    __syncthreads();
+
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) sdata[tid] += sdata[tid + stride];
+        __syncthreads();
+    }
+    if (tid == 0) out[blockIdx.x] = sdata[0];
+}
+
+int main() {
+    const int rows = 1 << 14;
+    const int cols = 256;
+    const size_t nElem = static_cast<size_t>(rows) * cols;
+    const size_t inBytes  = nElem * sizeof(float);
+    const size_t outBytes = ((rows + 255) / 256) * sizeof(float);
+
+    float *hIn  = nullptr;
+    float *hOut = nullptr;
+    CUDA_CHECK(cudaMallocHost(&hIn,  inBytes));
+    CUDA_CHECK(cudaMallocHost(&hOut, outBytes));
+
+    for (size_t i = 0; i < nElem; ++i) hIn[i] = 1.0f;
+
+    float *dIn = nullptr, *dOut = nullptr;
+    CUDA_CHECK(cudaMalloc(&dIn,  inBytes));
+    CUDA_CHECK(cudaMalloc(&dOut, outBytes));
+    CUDA_CHECK(cudaMemcpy(dIn, hIn, inBytes, cudaMemcpyHostToDevice));
+
+    dim3 block(256);
+    dim3 grid((rows + block.x - 1) / block.x);
+    size_t smem = block.x * sizeof(float);
+
+    cudaEvent_t start, stop;
+    CUDA_CHECK(cudaEventCreate(&start));
+    CUDA_CHECK(cudaEventCreate(&stop));
+    CUDA_CHECK(cudaEventRecord(start));
+    row_reduce<<<grid, block, smem>>>(dIn, dOut, cols, rows);
+    CUDA_CHECK(cudaEventRecord(stop));
+    CUDA_CHECK(cudaEventSynchronize(stop));
+
+    float ms = 0.0f;
+    CUDA_CHECK(cudaEventElapsedTime(&ms, start, stop));
+    printf("Kernel time: %.3f ms\n", ms);
+
+    CUDA_CHECK(cudaFree(dIn));
+    CUDA_CHECK(cudaFree(dOut));
+    CUDA_CHECK(cudaFreeHost(hIn));
+    CUDA_CHECK(cudaFreeHost(hOut));
+    return 0;
+}
