@@ -1,0 +1,55 @@
+#include <cstdio>
+#include <cstdlib>
+#include <cuda_runtime.h>
+
+#define CUDA_CHECK(call) do { cudaError_t e = (call); if (e != cudaSuccess) { \
+    fprintf(stderr, "CUDA error %s:%d: %s\n", __FILE__, __LINE__, cudaGetErrorString(e)); exit(1); }} while(0)
+
+constexpr int BIN_COUNT = 256;
+
+__global__ void histogram(const unsigned int* __restrict__ data, size_t n, unsigned int* __restrict__ global_hist) {
+    extern __shared__ unsigned int shist[];
+    int tid = threadIdx.x;
+    for (int i = tid; i < BIN_COUNT; i += blockDim.x) shist[i] = 0;
+    __syncthreads();
+
+    for (size_t i = blockIdx.x * blockDim.x + tid; i < n; i += blockDim.x * gridDim.x)
+        atomicAdd(&shist[data[i]], 1);
+    __syncthreads();
+
+    if (tid < BIN_COUNT) atomicAdd(&global_hist[tid], shist[tid]);
+}
+
+int main() {
+    constexpr size_t N = 10'000'000;
+    unsigned int* h_data = new unsigned int[N];
+    for (size_t i = 0; i < N; ++i) h_data[i] = rand() % BIN_COUNT;
+
+    unsigned int *d_data, *d_hist;
+    CUDA_CHECK(cudaMalloc(&d_data, N * sizeof(unsigned int)));
+    CUDA_CHECK(cudaMalloc(&d_hist, BIN_COUNT * sizeof(unsigned int)));
+    CUDA_CHECK(cudaMemcpy(d_data, h_data, N * sizeof(unsigned int), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemset(d_hist, 0, BIN_COUNT * sizeof(unsigned int)));
+
+    constexpr int threads = 256;
+    constexpr int blocks = 256;
+    constexpr size_t shmem = BIN_COUNT * sizeof(unsigned int);
+
+    cudaEvent_t start, stop;
+    CUDA_CHECK(cudaEventCreate(&start));
+    CUDA_CHECK(cudaEventCreate(&stop));
+    CUDA_CHECK(cudaEventRecord(start));
+    histogram<<<blocks, threads, shmem>>>(d_data, N, d_hist);
+    CUDA_CHECK(cudaEventRecord(stop));
+    CUDA_CHECK(cudaEventSynchronize(stop));
+
+    float ms = 0;
+    CUDA_CHECK(cudaEventElapsedTime(&ms, start, stop));
+    printf("Processed %zu samples in %.3f ms (%.3f M updates/s)\n",
+           N, ms, (N / (ms / 1e3)) / 1e6);
+
+    CUDA_CHECK(cudaFree(d_data));
+    CUDA_CHECK(cudaFree(d_hist));
+    delete[] h_data;
+    return 0;
+}
